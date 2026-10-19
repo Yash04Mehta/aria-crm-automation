@@ -1,0 +1,14 @@
+{
+  "name": "aria-crm-automation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "n8n workflow that logs Aria voice-agent calls to Google Sheets and alerts the support team on follow-ups",
+  "scripts": {
+    "test": "node --test",
+    "build": "node scripts/build-workflow.mjs",
+    "send": "node scripts/send-test-call.mjs",
+    "n8n": "npx n8n"
+  },
+  "engines": { "node": ">=20" }
+}

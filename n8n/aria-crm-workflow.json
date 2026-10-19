@@ -1,0 +1,195 @@
+{
+  "name": "Aria → CRM: log calls and alert on follow-ups",
+  "nodes": [
+    {
+      "id": "aria-call-ended",
+      "name": "Aria call ended",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aria-call",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "aria-call"
+    },
+    {
+      "id": "prepare-row-priority",
+      "name": "Prepare row & priority",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Business rules for each finished call. This exact code runs inside the n8n \"Code\" node\n// (scripts/build-workflow.mjs copies it into the workflow), and the same file is unit-tested\n// in test/route.test.mjs, so the rules in n8n and the tested rules can't drift apart.\n\nconst FOLLOW_UP_STATUSES = [\"ESCALATED\", \"UNRESOLVED\", \"INCOMPLETE\"];\n\nfunction routeCall(call, now = new Date()) {\n  const status = String(call.resolution_status || \"UNKNOWN\").toUpperCase();\n  const sentiment = String(call.customer_sentiment || \"NEUTRAL\").toUpperCase();\n  const hadConversation = String(call.customer_intent || \"\") !== \"NO_INTERACTION\";\n\n  // Does a human need to act on this call?\n  const reasons = [];\n  if (call.follow_up_required === true) reasons.push(\"agent flagged a follow-up\");\n  if (hadConversation && FOLLOW_UP_STATUSES.includes(status)) reasons.push(`status ${status}`);\n  if (sentiment === \"NEGATIVE\") reasons.push(\"unhappy customer\");\n  const needsFollowUp = reasons.length > 0;\n\n  // How urgent? Unhappy + escalated first, then any unhappy or escalated call, then the rest.\n  let priority = \"LOW\";\n  if (needsFollowUp) priority = \"MEDIUM\";\n  if (sentiment === \"NEGATIVE\" || status === \"ESCALATED\") priority = \"HIGH\";\n  if (sentiment === \"NEGATIVE\" && status === \"ESCALATED\") priority = \"URGENT\";\n\n  // Promise a reply time the support team can keep.\n  const hoursToReply = { URGENT: 2, HIGH: 4, MEDIUM: 24, LOW: null }[priority];\n  const replyBy = hoursToReply ? new Date(now.getTime() + hoursToReply * 3600 * 1000) : null;\n  const ist = (d) => d.toLocaleString(\"en-IN\", { timeZone: \"Asia/Kolkata\", dateStyle: \"medium\", timeStyle: \"short\" });\n\n  const who = call.customer_name ? `${call.customer_name} (${call.order_id})` : call.order_id || \"Unknown customer\";\n  const actions = Array.isArray(call.actions_taken) ? call.actions_taken : [];\n\n  return {\n    // Columns for the Google Sheet. The sheet's header row must use these exact names.\n    \"Logged At\": ist(now),\n    \"Call ID\": call.call_id || \"\",\n    \"Customer\": call.customer_name || \"\",\n    \"Order ID\": call.order_id || \"\",\n    \"Product\": call.product || \"\",\n    \"Intent\": call.customer_intent || \"\",\n    \"Status\": status,\n    \"Sentiment\": sentiment,\n    \"Priority\": priority,\n    \"Follow-up\": needsFollowUp ? \"Yes\" : \"No\",\n    \"Reply By\": replyBy ? ist(replyBy) : \"\",\n    \"Duration (s)\": call.duration_seconds ?? \"\",\n    \"Summary\": call.call_summary || \"\",\n    \"Actions\": actions.join(\"; \"),\n    // Used by the alert nodes, not written to the sheet.\n    needs_follow_up: needsFollowUp,\n    alert_text: needsFollowUp\n      ? [\n          `🔔 ${priority} follow-up: ${who}`,\n          `Reason: ${reasons.join(\", \")}`,\n          `Issue: ${call.call_summary || \"(no summary)\"}`,\n          actions.length ? `Done so far: ${actions.join(\"; \")}` : null,\n          `Reply by: ${ist(replyBy)}`,\n          `Call ID: ${call.call_id || \"-\"}`,\n        ].filter(Boolean).join(\"\\n\")\n      : \"\",\n  };\n}\n\n// --- n8n entry point (ignored outside n8n) ---\n// The Webhook node puts the POSTed JSON under \"body\".\nif (typeof $input !== \"undefined\") {\n  return $input.all().map((item) => ({ json: routeCall(item.json.body ?? item.json) }));\n}\n\nif (typeof module !== \"undefined\") module.exports = { routeCall };\n"
+      }
+    },
+    {
+      "id": "log-call-to-google-sheet",
+      "name": "Log call to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        520,
+        160
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "PASTE_YOUR_GOOGLE_SHEET_URL"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Calls"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {
+          "handlingExtraData": "ignoreIt"
+        }
+      }
+    },
+    {
+      "id": "needs-follow-up-",
+      "name": "Needs follow-up?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        520,
+        440
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "needs-follow-up",
+              "leftValue": "={{ $json.needs_follow_up }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "whatsapp-support-lead",
+      "name": "WhatsApp support lead",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        800,
+        360
+      ],
+      "parameters": {
+        "from": "+14155238886",
+        "to": "+91XXXXXXXXXX",
+        "toWhatsapp": true,
+        "message": "={{ $json.alert_text }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "email-support-inbox",
+      "name": "Email support inbox",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1060,
+        360
+      ],
+      "parameters": {
+        "fromEmail": "you@gmail.com",
+        "toEmail": "support-team@example.com",
+        "subject": "={{ $json.Priority }} follow-up: {{ $json.Customer || $json['Order ID'] || $json['Call ID'] }}",
+        "emailFormat": "text",
+        "text": "={{ $json.alert_text }}\n\nFull call log: PASTE_YOUR_GOOGLE_SHEET_URL",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Aria call ended": {
+      "main": [
+        [
+          {
+            "node": "Prepare row & priority",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare row & priority": {
+      "main": [
+        [
+          {
+            "node": "Log call to Google Sheet",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Needs follow-up?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs follow-up?": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp support lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "WhatsApp support lead": {
+      "main": [
+        [
+          {
+            "node": "Email support inbox",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false
+}

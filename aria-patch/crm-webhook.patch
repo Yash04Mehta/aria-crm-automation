@@ -1,0 +1,158 @@
+diff --git a/.env.example b/.env.example
+index f309094..1771155 100644
+--- a/.env.example
++++ b/.env.example
+@@ -6,3 +6,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
+ # LIVE_MODEL=gemini-3.8-live
+ # SUMMARY_MODEL=gemini-3.5-flash-lite
+ # AGENT_VOICE=Kore
++
++# Optional: send every call's outcome to an automation webhook (e.g. n8n). Off when empty.
++# CRM_WEBHOOK_URL=http://localhost:5678/webhook/aria-call
++# CRM_WEBHOOK_SECRET=choose-a-long-random-string
+diff --git a/app/api/summary/route.ts b/app/api/summary/route.ts
+index edf29bc..cfde4ae 100644
+--- a/app/api/summary/route.ts
++++ b/app/api/summary/route.ts
+@@ -4,6 +4,8 @@
+ // so the evaluator always gets a result.
+ 
+ import { GoogleGenAI, Type } from "@google/genai";
++import { after } from "next/server";
++import { buildCrmPayload, notifyCrm, type CallMeta } from "@/lib/crm";
+ import { clientIp, rateLimit } from "@/lib/rate-limit";
+ 
+ export const runtime = "nodejs";
+@@ -71,7 +73,7 @@ export async function POST(req: Request) {
+     return Response.json({ error: "Too many requests" }, { status: 429 });
+   }
+ 
+-  let body: { transcript?: Line[]; tools?: ToolLog[] };
++  let body: { transcript?: Line[]; tools?: ToolLog[]; meta?: CallMeta };
+   try {
+     body = await req.json();
+   } catch {
+@@ -80,8 +82,14 @@ export async function POST(req: Request) {
+   const transcript = (body.transcript ?? []).slice(-200);
+   const tools = (body.tools ?? []).slice(-50);
+ 
++  // Every outcome goes through here so the optional CRM webhook sees all calls.
++  const respond = (summary: Record<string, unknown>, source: string) => {
++    if (process.env.CRM_WEBHOOK_URL) after(() => notifyCrm(buildCrmPayload(summary, source, body.meta, transcript)));
++    return Response.json({ summary, source });
++  };
++
+   if (!transcript.some((l) => l.role === "customer" && l.text.trim())) {
+-    return Response.json({ summary: emptyCall(), source: "rules" });
++    return respond(emptyCall(), "rules");
+   }
+ 
+   const apiKey = process.env.GEMINI_API_KEY;
+@@ -105,13 +113,13 @@ ${toolText || "(none)"}`,
+       });
+ 
+       const summary = JSON.parse(res.text ?? "{}");
+-      return Response.json({ summary, source: "llm" });
++      return respond(summary, "llm");
+     } catch (e) {
+       console.error("Summary model failed, using rules", e);
+     }
+   }
+ 
+-  return Response.json({ summary: ruleBasedSummary(transcript, tools), source: "rules" });
++  return respond(ruleBasedSummary(transcript, tools), "rules");
+ }
+ 
+ function emptyCall() {
+diff --git a/lib/crm.ts b/lib/crm.ts
+new file mode 100644
+index 0000000..b4fc50f
+--- /dev/null
++++ b/lib/crm.ts
+@@ -0,0 +1,73 @@
++// Optional CRM hand-off: after each call, send the outcome to an automation webhook (n8n).
++//
++// Off by default. Nothing happens unless CRM_WEBHOOK_URL is set, so the agent behaves
++// exactly as before without it. The webhook runs after the response is sent (Next.js
++// `after`), so a slow or broken CRM can never delay or break the customer's call screen.
++
++import { ORDERS } from "@/lib/orders";
++
++export interface CallMeta {
++  call_id?: string;
++  started_at?: string;
++  duration_seconds?: number;
++  ended_by?: string;
++  customer_turns?: number;
++  tools_called?: string[];
++}
++
++interface Line {
++  role: string;
++  text: string;
++}
++
++export function buildCrmPayload(
++  summary: Record<string, unknown>,
++  source: string,
++  meta: CallMeta | undefined,
++  transcript: Line[],
++) {
++  const orderId = typeof summary.order_id === "string" ? summary.order_id.toUpperCase() : null;
++  // Enrich with what the business already knows about this order (customer name, product, value).
++  const order = orderId ? ORDERS.find((o) => o.order_id === orderId) : undefined;
++  return {
++    event: "call.completed",
++    agent: "aria",
++    call_id: meta?.call_id ?? `CALL-${Date.now()}`,
++    started_at: meta?.started_at ?? new Date().toISOString(),
++    duration_seconds: meta?.duration_seconds ?? null,
++    ended_by: meta?.ended_by ?? null,
++    customer_intent: summary.customer_intent ?? null,
++    resolution_status: summary.resolution_status ?? null,
++    customer_sentiment: summary.customer_sentiment ?? null,
++    follow_up_required: summary.follow_up_required === true,
++    order_id: orderId,
++    customer_name: order?.customer_name ?? null,
++    product: order?.product ?? null,
++    order_value_inr: order?.value_inr ?? null,
++    policy_applied: summary.policy_applied ?? null,
++    actions_taken: Array.isArray(summary.actions_taken) ? summary.actions_taken : [],
++    call_summary: summary.call_summary ?? "",
++    summary_source: source,
++    transcript: transcript.map((l) => `${l.role.toUpperCase()}: ${l.text}`).join("\n").slice(0, 20000),
++  };
++}
++
++export async function notifyCrm(payload: ReturnType<typeof buildCrmPayload>): Promise<void> {
++  const url = process.env.CRM_WEBHOOK_URL;
++  if (!url) return;
++  try {
++    const res = await fetch(url, {
++      method: "POST",
++      headers: {
++        "Content-Type": "application/json",
++        // Shared secret so the workflow can reject requests that didn't come from Aria.
++        ...(process.env.CRM_WEBHOOK_SECRET ? { "X-Aria-Secret": process.env.CRM_WEBHOOK_SECRET } : {}),
++      },
++      body: JSON.stringify(payload),
++      signal: AbortSignal.timeout(5000),
++    });
++    if (!res.ok) console.error(`CRM webhook returned ${res.status}`);
++  } catch (e) {
++    console.error("CRM webhook failed", e);
++  }
++}
+diff --git a/lib/useVoiceAgent.ts b/lib/useVoiceAgent.ts
+index 4c45476..ac5649c 100644
+--- a/lib/useVoiceAgent.ts
++++ b/lib/useVoiceAgent.ts
+@@ -345,7 +345,7 @@ export function useVoiceAgent() {
+       const r = await fetch("/api/summary", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ transcript, tools: toolLog.current }),
++        body: JSON.stringify({ transcript, tools: toolLog.current, meta }),
+       });
+       const data = await r.json();
+       setOutcome({ summary: data.summary ?? null, source: data.source, error: data.error, meta });
